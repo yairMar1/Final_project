@@ -4,7 +4,7 @@ import re
 import os
 
 # --- Configuration ---
-RAW_DATA_DIR = "../../data/raw/" # Relative to this script's location
+RAW_DATA_DIR = "../../data/raw/"  # Relative to this script's location
 #NUS_CORPUS_SUBDIR = "nus_sms_corpus/" # If NUS data is in a subfolder
 PROCESSED_DATA_DIR = "../../data/processed/"
 
