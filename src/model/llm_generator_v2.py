@@ -73,6 +73,16 @@ SPAM_KEYWORDS = [
     "offer","promo","deal","voucher","gift","reward","today","now"
 ]
 
+DEFAULT_HARD_PROMPTS = 12      # cap how many unique prompts we build
+DEFAULT_HARD_FEW = 3          # how many examples per prompt (keep small)
+EXAMPLE_TRIM_WORDS = 18        # compress examples to keep prompts short
+
+def _trim_words(text: str, n: int) -> str:
+    w = re.findall(r"\S+", str(text).strip())
+    if len(w) <= n:
+        return " ".join(w)
+    return " ".join(w[:n]) + "…"
+
 def _clean_line(s: str) -> str:
     s = s.replace("\r", "\n").strip()
     s = s.split("\n", 1)[0].strip()
@@ -247,39 +257,51 @@ def generate_spam_messages(
     per_prompt=3,
     batch_size=24,
     dedup_against_train=False,
+    hard_prompts=DEFAULT_HARD_PROMPTS,
+    hard_few=DEFAULT_HARD_FEW,
+    max_new_tokens=36,
 ):
     reasons = {"invalid": 0, "duplicate_in_batch": 0, "duplicate_in_train": 0}
     accepted, seen = [], set()
     train_norm_set = load_train_norm_set() if dedup_against_train else set()
 
-    # Build the initial prompt list
     prompts = []
     if mode == "full":
-        base_prompt = FULL_PROMPT
-        prompts = [base_prompt] * max(1, math.ceil(num_messages / per_prompt))
+        base = FULL_PROMPT
+        prompts = [base] * max(1, math.ceil(num_messages / per_prompt))
 
     elif mode == "hard":
         if not hard_examples:
             raise ValueError("Hard mode requires a list of hard examples.")
         pool = hard_examples[:]
         random.shuffle(pool)
-        for i in range(0, len(pool), 3):
-            few = pool[i:i+3]
-            if not few:
-                break
+
+        # TRIM & SAMPLE: keep prompts short and few
+        few_lists = []
+        i = 0
+        while i < len(pool) and len(few_lists) < max(1, hard_prompts):
+            few = []
+            for _ in range(max(1, hard_few)):
+                if i >= len(pool): break
+                few.append(_trim_words(pool[i], EXAMPLE_TRIM_WORDS))
+                i += 1
+            if few:
+                few_lists.append(few)
+
+        for few in few_lists:
             examples_str = "\n".join(f"- {m}" for m in few)
             prompts.append(HARD_PROMPT_TEMPLATE.format(examples=examples_str))
-        if not prompts:
-            prompts = [
-                HARD_PROMPT_TEMPLATE.format(
-                    examples="\n".join(f"- {m}" for m in random.sample(hard_examples, min(3, len(hard_examples))))
-                )
-            ]
 
-    # Ensure tokenizer pad token
+        # Fallback in case hard_prompts=0 or nothing built
+        if not prompts:
+            few = [_trim_words(m, EXAMPLE_TRIM_WORDS) for m in
+                   random.sample(hard_examples, min(hard_few, len(hard_examples)))]
+            prompts = [HARD_PROMPT_TEMPLATE.format(examples="\n".join(f"- {m}" for m in few))]
+
+    # Pad token safety
     generator.tokenizer.pad_token = getattr(generator.tokenizer, "eos_token", generator.tokenizer.pad_token)
 
-    # Soft bad words (reduce overblocking)
+    # Soft bad words
     bad_words = [
         "Your message", "your message:", "Here is", "Here's",
         "Your SMS", "your sms:", "Your SMS:", "SMS:",
@@ -287,23 +309,20 @@ def generate_spam_messages(
     ]
     bad_words_ids = generator.tokenizer(bad_words, add_special_tokens=False).input_ids
 
-    # Open-ended generation until target is reached (with a safe cap)
     target = num_messages
-    max_attempts = max(4, math.ceil(target * 2.0))  # enough extra tries to reach target
-    attempts = 0
-    idx = 0
+    max_attempts = max(4, math.ceil(target * 2.0))
+    attempts, idx = 0, 0
 
     while len(accepted) < target and attempts < max_attempts:
-        # If we've consumed all prepared prompts, keep using the last prompt batch (esp. for full mode)
         if idx >= len(prompts):
             idx = 0
-        batch_prompts = prompts[idx : min(idx + batch_size, len(prompts))]
+        batch_prompts = prompts[idx: min(idx + batch_size, len(prompts))]
         idx += batch_size
         attempts += 1
 
         outputs = generator(
             batch_prompts,
-            max_new_tokens=36,              # SMS-length and a bit
+            max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=0.8,
             top_p=0.92,
@@ -315,14 +334,10 @@ def generate_spam_messages(
             return_full_text=False,
         )
 
-        # Flatten pipeline outputs
         flat = []
         if isinstance(outputs, list):
             for item in outputs:
-                if isinstance(item, list):
-                    flat.extend(item)
-                else:
-                    flat.append(item)
+                flat.extend(item if isinstance(item, list) else [item])
 
         for d in flat:
             raw = d.get("generated_text", d.get("text", ""))
@@ -331,9 +346,7 @@ def generate_spam_messages(
                 reasons["invalid"] += 1
                 continue
 
-            candidate = _clean_line(candidate)
-            candidate = _strip_wrappers(candidate)
-            candidate = _clean_line(candidate)
+            candidate = _clean_line(_strip_wrappers(_clean_line(candidate)))
 
             if not _valid_spam(candidate):
                 reasons["invalid"] += 1
@@ -353,8 +366,7 @@ def generate_spam_messages(
                 break
 
     print(f"kept {len(accepted)}/{target} | dropped: {reasons}")
-    accepted = list(dict.fromkeys(accepted))
-    return accepted
+    return list(dict.fromkeys(accepted))
 
 # ── CLI ───────────────────────────────────────────────────────
 def build_argparser():
@@ -362,23 +374,25 @@ def build_argparser():
     ap.add_argument("--mode", type=str, default="full", choices=["full", "hard"])
     ap.add_argument("--num_messages", type=int, default=None)
     ap.add_argument("--output", type=str, default=DEFAULT_OUTPUT)
-    ap.add_argument("--hard_files", type=str, default="")  # comma-separated under processed/
-    ap.add_argument("--per_prompt", type=int, default=3)
+    ap.add_argument("--hard_files", type=str, default="")
+    ap.add_argument("--per_prompt", type=int, default=8)
     ap.add_argument("--batch_size", type=int, default=24)
     ap.add_argument("--dedup_train", action="store_true")
+    ap.add_argument("--hard_prompts", type=int, default=DEFAULT_HARD_PROMPTS,
+                    help="Max number of unique prompts to build in hard mode.")
+    ap.add_argument("--hard_few", type=int, default=DEFAULT_HARD_FEW,
+                    help="Number of examples per hard prompt (keep small for speed).")
+    ap.add_argument("--max_new_tokens", type=int, default=36,
+                    help="Max new tokens per SMS generation.")
     return ap
-
 def main():
     args = build_argparser().parse_args()
     if args.num_messages is None:
         args.num_messages = 2000 if args.mode == "full" else 500
 
-    # Load hard examples, if needed
     hard_examples = None
     if args.mode == "hard":
-        files_list = None
-        if args.hard_files.strip():
-            files_list = [s.strip() for s in args.hard_files.split(",") if s.strip()]
+        files_list = [s.strip() for s in args.hard_files.split(",") if s.strip()] if args.hard_files.strip() else None
         hard_examples = load_hard_examples_from_processed(files_list)
         print("Incoming hard examples actually used:", len(hard_examples))
         if not hard_examples:
@@ -386,13 +400,13 @@ def main():
             print(f"✅ Generated 0 messages in hard mode → saved to {args.output}")
             return
 
-    # Use the Instruct model for cleaner outputs
+    # Use dtype (not torch_dtype) to avoid the deprecation warning
     gen = pipeline(
         "text-generation",
         model="mistralai/Mistral-7B-Instruct-v0.3",
         device=0,
         return_full_text=False,
-        model_kwargs={"torch_dtype": torch.float16},
+        dtype=torch.float16,
     )
     gen.tokenizer.pad_token = getattr(gen.tokenizer, "eos_token", gen.tokenizer.pad_token)
 
@@ -404,6 +418,9 @@ def main():
         per_prompt=args.per_prompt,
         batch_size=args.batch_size,
         dedup_against_train=args.dedup_train,
+        hard_prompts=args.hard_prompts,
+        hard_few=args.hard_few,
+        max_new_tokens=args.max_new_tokens,
     )
 
     df_out = pd.DataFrame({"message": messages, "label": [1] * len(messages)})

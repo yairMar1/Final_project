@@ -350,35 +350,57 @@ def main():
     probs = torch.cat(probs_list).numpy()
     energy = torch.cat(energy_list).numpy()
 
+    # --- Build calibrated scores frame ---
     df_scores = df_base.copy()
-    df_scores["prob_spam"] = probs  # כבר NumPy
+    df_scores["prob_spam"] = probs  # numpy -> float column
     df_scores["energy"] = energy
 
-    # סיווג לפי אנרגיה
+    # Energy-rule prediction at calibrated τ_e (1 = spam if energy <= τ_e)
     df_scores["pred_energy"] = (df_scores["energy"] <= tau_e).astype(int)
+
+    # Convenience cols
+    df_scores["delta_to_tau"] = df_scores["energy"] - tau_e  # >0 => more "ham-like"
     spam_mask = (df_scores["label"] == 1)
 
-    # False negatives (ספאם שזוהה כלא ספאם)
-    fn_mask = (df_scores["pred_energy"] == 0) & spam_mask
-    df_fn = df_scores[fn_mask].copy()
+    # 1) FALSE NEGATIVES (hardest): actual spam predicted ham by the energy rule
+    fn_mask = ((df_scores["pred_energy"] == 0) & spam_mask)  # pred_energy==0 => energy > τ_e
+    df_fn = df_scores.loc[fn_mask, ["label", "message", "energy", "delta_to_tau"]].copy()
+    # Prioritize FNs most on ham side (largest positive delta_to_tau)
+    df_fn = df_fn.sort_values("delta_to_tau", ascending=False)
 
-    # Borderline סביב הסף לפי מרחק מוחלט מה-τ
+    # 2) BORDERLINE: closest to τ_e among spam (exclude FNs to avoid dupes)
     if spam_mask.any():
-        energy_margin = np.percentile(np.abs(df_scores.loc[spam_mask, "energy"] - tau_e), 7)
+        bl_pool = df_scores.loc[spam_mask, ["label", "message", "energy", "delta_to_tau"]].copy()
+        if not df_fn.empty:
+            bl_pool = bl_pool.loc[~bl_pool["message"].isin(df_fn["message"])]
+        bl_pool["abs_delta"] = bl_pool["delta_to_tau"].abs()
     else:
-        energy_margin = 0.05
-    borderline_mask = spam_mask & (np.abs(df_scores["energy"] - tau_e) <= energy_margin)
-    df_borderline = df_scores[borderline_mask].copy()
+        bl_pool = pd.DataFrame(columns=["label", "message", "energy", "delta_to_tau", "abs_delta"])
 
-    # ✨ תיקן: השתמש ב-percentile (או quantile עם 0.80) ולא quantile(…, 80)
-    if spam_mask.sum() >= 5:
-        cutoff = np.percentile(df_scores.loc[spam_mask, "energy"].values, 93)  # top 7% hardest
-        df_bottom = df_scores[spam_mask & (df_scores["energy"] >= cutoff)].copy()
-    else:
-        print("INFO: Not enough spam examples to compute 80th percentile; skipping 'bottompct'.")
-        df_bottom = pd.DataFrame(columns=df_scores.columns)
+    TARGET_TOTAL = int(os.environ.get("HARD_POOL_CAP", "300"))
+    target_bl = max(40, int(TARGET_TOTAL * 0.33))  # ~1/3 budget for borderline
+    df_borderline = (
+        bl_pool.nsmallest(target_bl, "abs_delta")[["label", "message", "energy", "delta_to_tau"]]
+        if not bl_pool.empty else
+        pd.DataFrame(columns=["label", "message", "energy", "delta_to_tau"])
+    )
 
-    # כתיבה לקבצים (גם אם ריקים – כדי שהפייפליין ימשיך)
+    # 3) TOP-ENERGY spam: highest energy among remaining spam (closest to ham), excluding FNs & borderline
+    top_pool = df_scores.loc[spam_mask, ["label", "message", "energy", "delta_to_tau"]].copy()
+    if not df_fn.empty:
+        top_pool = top_pool.loc[~top_pool["message"].isin(df_fn["message"])]
+    if not df_borderline.empty:
+        top_pool = top_pool.loc[~top_pool["message"].isin(df_borderline["message"])]
+
+    taken_so_far = len(df_fn) + len(df_borderline)
+    target_top = max(40, TARGET_TOTAL - taken_so_far)  # fill the rest up to TARGET_TOTAL
+    df_bottom = (
+        top_pool.nlargest(target_top, "energy")
+        if not top_pool.empty else
+        pd.DataFrame(columns=["label", "message", "energy", "delta_to_tau"])
+    )
+
+    # 4) WRITE outputs for the generator (just label+message)
     out_scores_path = os.path.join(PROCESSED_DATA_DIR, "discriminator_scores_train.csv")
     out_fn_path = os.path.join(PROCESSED_DATA_DIR, "hard_spam_false_negatives.csv")
     out_bl_path = os.path.join(PROCESSED_DATA_DIR, "hard_spam_borderline.csv")
@@ -389,11 +411,11 @@ def main():
     df_borderline[["label", "message"]].to_csv(out_bl_path, index=False)
     df_bottom[["label", "message"]].to_csv(out_bot_path, index=False)
 
-    print("HARD MINING DONE (energy-aware):")
-    print("  scores ->", out_scores_path)
-    print("  false negatives ->", out_fn_path, f"({len(df_fn)})")
-    print("  borderline ->", out_bl_path, f"({len(df_borderline)})")
-    print("  hardest (top energy) ->", out_bot_path, f"({len(df_bottom)})")
+    print("HARD MINING DONE (adaptive caps):")
+    print(f"  false negatives -> {out_fn_path} ({len(df_fn)})")
+    print(f"  borderline      -> {out_bl_path} ({len(df_borderline)})")
+    print(f"  top energy      -> {out_bot_path} ({len(df_bottom)})")
+
 
 if __name__ == "__main__":
     main()
